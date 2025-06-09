@@ -1,77 +1,103 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import streamlit as st
+import pdfplumber
+import pandas as pd
+import openai
+import os
+from dotenv import load_dotenv
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_community.vectorstores import FAISS
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+# .env 에서 API 키 불러오기
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# 단계 1: 문서 로드(Load Documents)
-loader = PyMuPDFLoader("pdfGPTdata.pdf")
-docs = loader.load()
+# 출석 정보 추출 함수
+def extract_attendance_summary(pdf_path: str, student_name: str):
+    records = []
 
-# 단계 2: 문서 분할(Split Documents)
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
-split_documents = text_splitter.split_documents(docs)
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            table = page.extract_table()
+            if not table or len(table) < 2:
+                continue
 
-# 단계 3: 임베딩(Embedding) 생성
-embeddings = OpenAIEmbeddings()
+            df = pd.DataFrame(table[1:], columns=table[0])
+            df.columns = [str(c).replace("\n", "").strip() for c in df.columns]
+            df = df[df['성명'].notna()]
+            if '성명' not in df.columns:
+                continue
 
-# 단계 4: DB 생성(Create DB) 및 저장
-# 벡터스토어를 생성합니다.
-vectorstore = FAISS.from_documents(documents=split_documents, embedding=embeddings)
+            if student_name in df['성명'].values:
+                row = df[df['성명'] == student_name].iloc[0]
 
-# 단계 5: 검색기(Retriever) 생성
-# 문서에 포함되어 있는 정보를 검색하고 생성합니다.
-retriever = vectorstore.as_retriever()
+                try:
+                    total = int(row['훈련일수'])
+                    attended = int(row['출석일수'])
+                    absent = int(row['결석일수'])
+                except ValueError:
+                    continue
 
-# 단계 6: 프롬프트 생성(Create Prompt)
-# 프롬프트를 생성합니다.
-prompt = PromptTemplate.from_template(
-    """You are an assistant for question-answering tasks. 
-Use the following pieces of retrieved context to answer the question. 
-If you don't know the answer, just say that you don't know. 
-Answer in Korean.
+                daily = [v for k, v in row.items() if k not in ['성명', '훈련일수', '출석일수', '결석일수']]
+                late = daily.count('◎')
+                early = daily.count('▲')
 
-#Question: 
-{question} 
-#Context: 
-{context} 
+                return {
+                    "name": student_name,
+                    "total": total,
+                    "attended": attended,
+                    "absent": absent,
+                    "late": late,
+                    "early": early,
+                    "completed": attended + absent,
+                    "remaining": total - (attended + absent)
+                }
 
-#Answer:"""
-)
+    return None
 
-# 단계 7: 언어모델(LLM) 생성
-# 모델(LLM) 을 생성합니다.
-llm = ChatOpenAI(model_name="gpt-4o-mini-2024-07-18", temperature=0.3)
+# GPT 요약 생성 함수
+def get_gpt_summary(attendance_info: dict):
+    prompt = f"""
+다음은 직업훈련 출석부에서 추출된 {attendance_info['name']} 학생의 출결 정보입니다:
 
-# 단계 8: 체인(Chain) 생성
-chain = (
-    {"context": retriever, "question": RunnablePassthrough()}
-    | prompt
-    | llm
-    | StrOutputParser()
-)
+- 총 훈련일수: {attendance_info['total']}일
+- 출석일수: {attendance_info['attended']}일
+- 결석일수: {attendance_info['absent']}일
+- 지각일수: {attendance_info['late']}일
+- 조퇴일수: {attendance_info['early']}일
+- 현재까지 수업일수: {attendance_info['completed']}일
+- 앞으로 남은 수업일수: {attendance_info['remaining']}일
+
+이 정보를 바탕으로 아래와 같이 출력 요약을 해주세요:
+
+1. 위의 항목을 한눈에 보기 쉽게 정리
+2. 지각, 조퇴, 결석 횟수에 따른 주의 멘트 포함 (예: 출결 문제 주의 필요)
+3. 가능한 한 자연스러운 말투로 요약
+    """
+
+    response = openai.ChatCompletion.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.5
+    )
+
+    return response.choices[0].message['content']
 
 # Streamlit UI
-st.title("📄 PDF 기반 Q&A 챗봇")
+st.set_page_config(page_title="출석 분석 앱", layout="centered")
+st.title("📋 직업훈련 출석 요약 생성기 (GPT-4o)")
 
-# 체인 실행(Run Chain)
-# 문서에 대한 질의를 입력하고, 답변을 출력합니다.
-# """ question = "김경훈씨의 결석 일수를 알려줘"
-# response = chain.invoke(question)
-# print(response) """
+pdf_file = st.file_uploader("출석부 PDF 파일을 업로드하세요", type=["pdf"])
+student_name = st.text_input("학생 이름을 입력하세요")
 
-question = st.text_input("질문을 입력하세요:")
-if st.button("질문하기"):
-    if question:
-        with st.spinner("답변 생성 중..."):
-            response = chain.invoke(question)
-        st.write("**답변:**", response.strip())
+if pdf_file and student_name:
+    with open("temp.pdf", "wb") as f:
+        f.write(pdf_file.read())
+
+    st.info("📑 PDF 분석 중...")
+    info = extract_attendance_summary("temp.pdf", student_name)
+
+    if info:
+        st.success(f"✅ {student_name} 학생의 출석 정보를 불러왔습니다.")
+        st.markdown("### 🤖 AI 요약 결과")
+        summary = get_gpt_summary(info)
+        st.write(summary)
     else:
-        st.warning("질문을 입력해주세요.")
+        st.error("❌ 해당 학생 정보를 PDF에서 찾을 수 없습니다.")
