@@ -128,7 +128,11 @@ def parse_pdf(pdf_file):
 
 # Streamlit 앱 실행
 
-st.title("📘 CBT 자동 생성 시험 시스템 (anns.pdf 기반)")
+# 상단 소제목 (작은 글씨)
+st.markdown("#### 교수자용")
+st.markdown("\n")
+st.title("📘 AI 기반 필답형 CBT 자동생성 시스템(PDF 기반) ")
+st.markdown("\n")
 uploaded_file = st.file_uploader("정답지 PDF 파일을 업로드하세요", type="pdf")
 
 if uploaded_file:
